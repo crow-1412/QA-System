@@ -137,9 +137,9 @@ if __name__ == "__main__":
     start = time.time()
 
     base = "."
-    qwen7 = base + "/pre_train_model/Qwen-7B-Chat"
-    m3e =  base + "/pre_train_model/m3e-large"
-    bge_reranker_large = base + "/pre_train_model/bge-reranker-large"
+    qwen7 = "/root/autodl-tmp/pre_train_model/Qwen-7B-Chat"
+    m3e = "/root/autodl-tmp/pre_train_model/m3e-large"
+    bge_reranker_large = "/root/autodl-tmp/pre_train_model/bge-reranker-large"
 
     # 解析pdf文档，构造数据
     dp =  DataProcess(pdf_path = base + "/data/train_a.pdf")
@@ -156,7 +156,7 @@ if __name__ == "__main__":
     print("data load ok")
 
     # Faiss召回
-    model_path = '/root/project/pre_train_model/m3e-large'
+    model_path = "/root/autodl-tmp/pre_train_model/m3e-large"
     faissretriever = FaissRetriever(model_path, data)
     vector_store = faissretriever.vector_store
     print("faissretriever load ok")

@@ -1,60 +1,39 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-import os
-import torch
-from sentence_transformers import SentenceTransformer, models
-from langchain_core.documents import Document
-from langchain_community.vectorstores import FAISS
+from langchain.schema import Document
+from langchain.vectorstores import FAISS
+from langchain.embeddings.huggingface import HuggingFaceEmbeddings
 from pdf_parse import DataProcess
-
+import torch
 
 class FaissRetriever(object):
-    def __init__(self, model, data):
+    def __init__(self, model_path, data):
         """初始化FAISS检索器
         
         Args:
-            model: HuggingFace embedding模型的路径或SentenceTransformer对象
+            model_path: HuggingFace embedding模型的路径
             data: 待索引的文本数据列表
         """
         try:
-            if isinstance(model, str):
-                self.model = SentenceTransformer(model)
-            else:
-                self.model = model
+            # 初始化HuggingFace embedding模型,使用GPU加速
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name=model_path,
+                model_kwargs={"device": "cuda"}
+            )
             
-            # 将模型移动到GPU（如果可用）
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            self.model.to(device)
-            
-            # 构建 Document 对象列表
+            # 构建Document对象列表
             docs = []
             for idx, line in enumerate(data):
                 line = line.strip("\n").strip()
                 words = line.split("\t")
                 docs.append(Document(page_content=words[0], metadata={"id": idx}))
-                
-            # 使用模型编码文档
-            print("Encoding documents...")
-            embeddings = self.model.encode([doc.page_content for doc in docs], 
-                                         normalize_embeddings=True,
-                                         show_progress_bar=True,
-                                         batch_size=32)
             
-            # 创建 FAISS 索引
-            print("Creating FAISS index...")
-            self.vector_store = FAISS.from_embeddings(
-                text_embeddings=[(doc.page_content, emb) for doc, emb in zip(docs, embeddings)],
-                embedding=self.model,
-                metadatas=[doc.metadata for doc in docs]
-            )
+            # 使用FAISS创建向量索引
+            self.vector_store = FAISS.from_documents(docs, self.embeddings)
             
-            # 释放资源
-            del embeddings
-            if torch.cuda.is_available():
-                with torch.cuda.device(device):
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
+            # 释放GPU缓存
+            torch.cuda.empty_cache()
                     
         except Exception as e:
             print(f"Error initializing FaissRetriever: {str(e)}")
@@ -63,8 +42,9 @@ class FaissRetriever(object):
     def GetTopK(self, query, k):
         """获取top-K分数最高的文档块"""
         try:
-            context = self.vector_store.similarity_search_with_score(query, k=k)
-            return context
+            # 直接返回similarity_search_with_score的结果
+            # 这个方法返回的是(Document, score)元组的列表
+            return self.vector_store.similarity_search_with_score(query, k=k)
         except Exception as e:
             print(f"Error in GetTopK: {str(e)}")
             return []

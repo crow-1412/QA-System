@@ -68,77 +68,108 @@ class ChatLLM(object):
         Args:
             model_path (str): 预训练模型的路径
         """
-        # 使用 modelscope 的方式加载
+        # 初始化tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
-            trust_remote_code=True
+            pad_token='<|extra_0|>',     # 设置填充token
+            eos_token='<|endoftext|>',   # 设置结束token  
+            padding_side='left',         # 设置在左侧进行填充
+            trust_remote_code=True       # 信任远程代码
         )
-        
-        # 加载模型
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            device_map="auto",
-            trust_remote_code=True
-        ).eval()
         
         # 加载生成配置
         self.generation_config = GenerationConfig.from_pretrained(
-            model_path,
-            trust_remote_code=True,
+            model_path, 
             pad_token_id=self.tokenizer.pad_token_id
         )
         
-        # 初始化停止词ID列表
-        self.stop_words_ids = []
-
         # 将生成配置的结束token ID同步到tokenizer
         self.tokenizer.eos_token_id = self.generation_config.eos_token_id
         
-        # 将停止词ID添加到列表中
+        # 初始化停止词ID列表
+        self.stop_words_ids = []
+        
+        # 加载vLLM大模型
+        self.model = LLM(
+            model=model_path,
+            tokenizer=model_path,
+            tensor_parallel_size=2,     # 保持双卡并行
+            trust_remote_code=True,
+            gpu_memory_utilization=0.8, # 降低内存使用率
+            dtype="bfloat16",
+            max_num_seqs=4,            # 限制并行序列数
+            max_num_batched_tokens=8192 # 修改为与max_model_len相同
+        )
+        
+        # 设置停止词
         for stop_id in get_stop_words_ids(self.generation_config.chat_format, self.tokenizer):
             self.stop_words_ids.extend(stop_id)
         self.stop_words_ids.extend([self.generation_config.eos_token_id])
 
-        # LLM的采样参数
+        # 修改采样参数
         sampling_kwargs = {
             "stop_token_ids": self.stop_words_ids,
-            "early_stopping": False,
             "top_p": 1.0,
-            "top_k": -1 if self.generation_config.top_k == 0 else self.generation_config.top_k,
-            "temperature": 0.0,
+            "top_k": 50,  # 修改为正数，避免 ValueError
+            "temperature": 0.7,  # 增加一些随机性
             "max_tokens": 2000,
             "repetition_penalty": self.generation_config.repetition_penalty,
-            "n":1,
-            "best_of":2,
-            "use_beam_search":True
+            "n": 1,
+            "best_of": 1  # 确保 best_of 等于 n
         }
         self.sampling_params = SamplingParams(**sampling_kwargs)
 
-    # 批量推理，输入一个batch，返回一个batch的答案
     def infer(self, prompts):
-       batch_text = []
-       for q in prompts:
-            raw_text, _ = make_context(
-              self.tokenizer,
-              q,
-              system="You are a helpful assistant.",
-              max_window_size=self.generation_config.max_window_size,
-              chat_format=self.generation_config.chat_format,
+        """批量推理，输入一个batch，返回一个batch的答案"""
+        try:
+            batch_text = []
+            for q in prompts:
+                raw_text, _ = make_context(
+                    self.tokenizer,
+                    q,
+                    system="You are a helpful assistant.",
+                    max_window_size=self.generation_config.max_window_size,
+                    chat_format=self.generation_config.chat_format,
+                )
+                batch_text.append(raw_text)
+                
+            outputs = self.model.generate(
+                batch_text,
+                sampling_params=self.sampling_params
             )
-            batch_text.append(raw_text)
-       outputs = self.model.generate(batch_text,
-                                sampling_params = self.sampling_params
-                               )
-       batch_response = []
-       for output in outputs:
-           output_str = output.outputs[0].text
-           if IMEND in output_str:
-               output_str = output_str[:-len(IMEND)] # 移除消息结束符   
-           if ENDOFTEXT in output_str:
-               output_str = output_str[:-len(ENDOFTEXT)] # 移除文本结束符
-           batch_response.append(output_str)
-       torch_gc()
-       return batch_response
+            
+            batch_response = []
+            for output in outputs:
+                output_str = output.outputs[0].text
+                if IMEND in output_str:
+                    output_str = output_str[:-len(IMEND)]
+                if ENDOFTEXT in output_str:
+                    output_str = output_str[:-len(ENDOFTEXT)]
+                batch_response.append(output_str)
+                
+            # 清理内存
+            torch.cuda.empty_cache()
+            return batch_response
+        except Exception as e:
+            print(f"Error in infer: {str(e)}")
+            torch.cuda.empty_cache()
+            return []
+
+    def GetTopK(self, query, k):
+        """获取top-K分数最高的文档块"""
+        try:
+            results = self.vector_store.similarity_search_with_score(query, k=k)
+            # 确保返回正确的格式
+            context = []
+            for doc, score in results:
+                if hasattr(doc, 'page_content'):
+                    context.append((doc.page_content, float(score)))
+                else:
+                    context.append((str(doc), float(score)))
+            return context
+        except Exception as e:
+            print(f"Error in GetTopK: {str(e)}")
+            return []
 
 if __name__ == "__main__":
     qwen7 = "/root/autodl-tmp/pre_train_model/Qwen-7B-Chat"

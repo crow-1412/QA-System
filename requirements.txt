@@ -9,3 +9,6 @@ jieba
 rank_bm25
 sentence-transformers
 text2vec==1.2.9
+faiss-gpu>=1.7.2
+transformers_stream_generator
+accelerate>=0.26.0
