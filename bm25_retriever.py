@@ -18,22 +18,23 @@ class BM25(object):
             docs = []        # 存储分词后的文档
             full_docs = []   # 存储原始文档
             
+            if not documents:
+                raise ValueError("Documents list is empty")
+                
             # 遍历处理每个输入文档
-            for idx, line in enumerate(documents):
+            for idx, doc in enumerate(documents):
                 try:
-                    # 清理文本
-                    line = line.strip("\n").strip()
+                    # 获取文档内容
+                    if isinstance(doc, Document):
+                        content = doc.page_content
+                    else:
+                        content = str(doc).strip()
                     
                     # 跳过过短的文本
-                    if len(line) < 5:
+                    if len(content) < 5:
                         continue
                     
                     # 分词处理
-                    words = line.split("\t")
-                    if not words:  # 确保分割后的文本非空
-                        continue
-                        
-                    content = words[0]
                     tokens = " ".join(jieba.cut_for_search(content))
                     
                     # 创建Document对象
@@ -47,6 +48,9 @@ class BM25(object):
                     print(f"Error processing document {idx}: {str(e)}")
                     continue
             
+            if not docs:
+                raise ValueError("No valid documents after processing")
+                
             # 保存文档集到实例变量
             self.documents = docs
             self.full_documents = full_docs

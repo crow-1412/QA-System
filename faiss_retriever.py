@@ -1,19 +1,25 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-from langchain.schema import Document
-from langchain.vectorstores import FAISS
-from langchain.embeddings.huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 from pdf_parse import DataProcess
 import torch
 
-class FaissRetriever(object):
+class FaissRetriever:
     def __init__(self, model_path, data):
         """初始化FAISS检索器
         
         Args:
             model_path: HuggingFace embedding模型的路径
             data: 待索引的文本数据列表
+            
+        主要步骤:
+            1. 初始化HuggingFace embedding模型,使用GPU加速
+            2. 将文本数据转换为Document对象列表,每个文档包含内容和id
+            3. 使用FAISS创建向量索引
+            4. 释放embedding模型和GPU缓存
         """
         try:
             # 初始化HuggingFace embedding模型,使用GPU加速
@@ -25,9 +31,16 @@ class FaissRetriever(object):
             # 构建Document对象列表
             docs = []
             for idx, line in enumerate(data):
-                line = line.strip("\n").strip()
-                words = line.split("\t")
-                docs.append(Document(page_content=words[0], metadata={"id": idx}))
+                # 如果已经是Document对象，直接使用其page_content
+                if isinstance(line, Document):
+                    docs.append(Document(page_content=line.page_content, metadata={"id": idx}))
+                else:
+                    # 清理文本,去除首尾空白和换行符
+                    line = line.strip("\n").strip()
+                    # 按tab分割文本
+                    words = line.split("\t")
+                    # 创建Document对象,包含文本内容和id
+                    docs.append(Document(page_content=words[0], metadata={"id": idx}))
             
             # 使用FAISS创建向量索引
             self.vector_store = FAISS.from_documents(docs, self.embeddings)
@@ -43,7 +56,6 @@ class FaissRetriever(object):
         """获取top-K分数最高的文档块"""
         try:
             # 直接返回similarity_search_with_score的结果
-            # 这个方法返回的是(Document, score)元组的列表
             return self.vector_store.similarity_search_with_score(query, k=k)
         except Exception as e:
             print(f"Error in GetTopK: {str(e)}")
@@ -56,7 +68,7 @@ class FaissRetriever(object):
 if __name__ == "__main__":
     base = "."
     model_name = base + "/pre_train_model/m3e-large" #text2vec-large-chinese
-    dp =  DataProcess(pdf_path = base + "/data/train_a.pdf")
+    dp = DataProcess(pdf_path = base + "/data/train_a.pdf")
     dp.ParseBlock(max_seq = 1024)
     dp.ParseBlock(max_seq = 512)
     print(len(dp.data))

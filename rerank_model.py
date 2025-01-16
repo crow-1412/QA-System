@@ -24,14 +24,31 @@ def torch_gc():
 # 加载rerank模型
 class reRankLLM(object):
     def __init__(self, model_path, max_length = 512):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_path)
-        self.model.eval()
-        self.model.half()
-        self.model.to(CUDA_DEVICE)
-        self.max_length = max_length
+        print(f"\nInitializing reRankLLM from {model_path}...")
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self.model = AutoModelForSequenceClassification.from_pretrained(model_path)
+            self.model.eval()
+            
+            # 检查CUDA是否可用
+            if torch.cuda.is_available():
+                print(f"Using CUDA device: {CUDA_DEVICE}")
+                try:
+                    self.model.to(CUDA_DEVICE)
+                    self.model.half()  # 只在成功移动到GPU后才使用半精度
+                except Exception as e:
+                    print(f"Error moving model to {CUDA_DEVICE}, falling back to CPU: {str(e)}")
+                    self.model.to('cpu')
+            else:
+                print("CUDA not available, using CPU")
+                self.model.to('cpu')
+                
+            self.max_length = max_length
+            print("reRankLLM initialized successfully")
+        except Exception as e:
+            print(f"Error initializing reRankLLM: {str(e)}")
+            raise
 
-    # 输入文档对，返回每一对(query, doc)的相关得分，并从大到小排序
     def predict(self, query, docs):
         """
         对输入的query和文档列表进行相关性重排序
@@ -43,26 +60,51 @@ class reRankLLM(object):
         Returns:
             List: 按相关性得分从高到低排序后的文档列表
         """
-        # 将query和每个文档组成(query, doc)对
-        pairs = [(query, doc.page_content) for doc in docs]
-        
-        # 使用tokenizer对文本对进行编码,获得模型输入
-        inputs = self.tokenizer(pairs, padding=True, truncation=True, return_tensors='pt', max_length=self.max_length).to(CUDA_DEVICE)
-        
-        # 使用模型计算相关性得分,关闭梯度计算
-        with torch.no_grad():
-            scores = self.model(**inputs).logits
+        try:
+            print(f"\nReranking {len(docs)} documents...")
             
-        # 将得分从GPU转移到CPU并转换为numpy数组
-        scores = scores.detach().cpu().clone().numpy()
-        
-        # 根据得分对文档进行排序,得分高的排在前面
-        response = [doc for score, doc in sorted(zip(scores, docs), reverse=True, key=lambda x:x[0])]
-        
-        # 清理GPU显存
-        torch_gc()
-        
-        return response
+            # 将query和每个文档组成(query, doc)对
+            pairs = [(query, doc.page_content) for doc in docs]
+            print("Created query-document pairs")
+            
+            # 分批处理，避免显存溢出
+            batch_size = 32
+            all_scores = []
+            
+            for i in range(0, len(pairs), batch_size):
+                batch = pairs[i:i + batch_size]
+                print(f"Processing batch {i//batch_size + 1}/{(len(pairs)-1)//batch_size + 1}")
+                
+                # 使用tokenizer对文本对进行编码
+                inputs = self.tokenizer(
+                    batch, 
+                    padding=True, 
+                    truncation=True, 
+                    return_tensors='pt', 
+                    max_length=self.max_length
+                )
+                
+                # 将输入移动到正确的设备
+                inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+                
+                # 计算得分
+                with torch.no_grad():
+                    batch_scores = self.model(**inputs).logits
+                    all_scores.extend(batch_scores.detach().cpu().numpy())
+            
+            # 根据得分排序
+            response = [doc for score, doc in sorted(zip(all_scores, docs), reverse=True, key=lambda x:x[0])]
+            print("Reranking completed")
+            
+            # 清理GPU显存
+            if torch.cuda.is_available():
+                torch_gc()
+            
+            return response
+            
+        except Exception as e:
+            print(f"Error in predict: {str(e)}")
+            return docs  # 如果重排序失败，返回原始文档列表
 
 if __name__ == "__main__":
     bge_reranker_large = "./pre_train_model/bge-reranker-large"

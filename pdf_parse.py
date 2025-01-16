@@ -117,6 +117,7 @@ class DataProcess(object):
 
     # 按照每页中块提取内容,并和一级标题进行组合,配合Document 可进行意图识别
     def ParseBlock(self, max_seq = 1024):
+        print(f"Parsing blocks with max_seq={max_seq}...")
         """
         按块解析PDF内容的主要方法
         参数:
@@ -183,6 +184,8 @@ class DataProcess(object):
                 # 处理页面最后剩余的文本
                 if(len(squence) > 0):
                     self.Datafilter(squence, header, i, max_seq = max_seq)
+
+        print(f"Found {len(self.data)} blocks")
 
     # 按句号划分文档，然后利用最大长度划分文档块
     def ParseOnePageWithRule(self, max_seq = 512, min_len = 6):

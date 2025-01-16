@@ -2,238 +2,195 @@
 # coding: utf-8
 
 import json
-import jieba
-import pandas as pd
-import numpy as np
-from tqdm import tqdm
-from langchain_core.documents import Document
-from langchain_community.vectorstores import Chroma, FAISS
-from langchain_core.prompts import PromptTemplate
-from langchain.chains import LLMChain
-from langchain.chains import RetrievalQA
 import time
-import re
-
+import torch
+from langchain_core.documents import Document
 from vllm_model import ChatLLM
-from rerank_model import reRankLLM
-from faiss_retriever import FaissRetriever
-from bm25_retriever import BM25
 from pdf_parse import DataProcess
-from sentence_transformers import SentenceTransformer
+from multi_retriever import MultiRetriever, MultiReranker
+from config import GPU_MEMORY_FRACTION, BATCH_SIZE, TENSOR_PARALLEL_SIZE
 
-def process_docs(docs, max_length=4000, max_docs=6):
+# 模型路径常量
+MODEL_PATHS = {
+    "qwen": "/root/autodl-tmp/pre_train_model/Qwen-7B-Chat",
+    "m3e": "/root/autodl-tmp/pre_train_model/m3e-large",
+    "bge": "/root/autodl-tmp/pre_train_model/bge-large-zh-v1.5",
+    "gte": "/root/autodl-tmp/pre_train_model/gte-large-zh",
+    "bce": "/root/autodl-tmp/pre_train_model/bce-embedding-base_v1",
+    "bge_reranker": "/root/autodl-tmp/pre_train_model/bge-reranker-large",
+    "bce_reranker": "/root/autodl-tmp/pre_train_model/bce-reranker-base_v1"
+}
+
+def process_docs(docs, max_length=400, max_docs=4):
     """处理文档列表，返回拼接后的内容
     
     Args:
         docs: 文档列表，可以是(doc, score)元组列表或doc列表
-        max_length: 最大长度限制
-        max_docs: 最多使用的文档数量
+        max_length: 最大长度限制，默认400 tokens
+        max_docs: 最多使用的文档数量，默认4个
     
     Returns:
         str: 拼接后的文档内容
     """
-    result = ""
-    cnt = 0
-    for item in docs:
-        doc = item[0] if isinstance(item, tuple) else item
-        cnt += 1
-        if len(result + doc.page_content) > max_length:
-            break
-        result += doc.page_content
-        if cnt >= max_docs:
-            break
-    return result
-
-# 获取Langchain的工具链 
-def get_qa_chain(llm, vector_store, prompt_template):
-
-    prompt = PromptTemplate(template=prompt_template,
-                            input_variables=["context", "question"])
-
-    return RetrievalQA.from_llm(llm=llm, retriever=vector_store.as_retriever(search_kwargs={"k": 10}), prompt=prompt)
-
-# 构造提示，根据merged faiss和bm25的召回结果返回答案
-def get_emb_bm25_merge(faiss_context, bm25_context, query):
-    max_length = 2500
-    emb_ans = process_docs(faiss_context, max_length)
-    bm25_ans = process_docs(bm25_context, max_length)
-
-    prompt_template = """基于以下已知信息，简洁和专业的来回答用户的问题。
-                                如果无法从中得到答案，请说 "无答案"或"无答案"，不允许在答案中添加编造成分，答案请使用中文。
-                                已知内容为吉利控股集团汽车销售有限公司的吉利用户手册:
-                                1: {emb_ans}
-                                2: {bm25_ans}
-                                问题:
-                                {question}""".format(emb_ans=emb_ans, bm25_ans = bm25_ans, question = query)
-    return prompt_template
-
+    try:
+        result = ""
+        cnt = 0
+        for item in docs:
+            doc = item[0] if isinstance(item, tuple) else item
+            content = doc.page_content if hasattr(doc, 'page_content') else str(doc)
+            
+            # 添加长度惩罚
+            length_penalty = min(1.0, 200 / (len(content) + 1e-6))
+            
+            # 如果单个文档就超过长度限制，进行截断
+            if len(content) > max_length:
+                content = content[:max_length]
+                
+            # 检查添加当前文档是否会超出长度限制
+            if len(result + content) > max_length:
+                break
+                
+            # 根据长度惩罚调整内容
+            content = content[:int(len(content) * length_penalty)]
+            result += content
+            cnt += 1
+            if cnt >= max_docs:
+                break
+                
+        return result
+    except Exception as e:
+        print(f"Error in process_docs: {str(e)}")
+        return ""
 
 def get_rerank(emb_ans, query):
-
-    prompt_template = """基于以下已知信息，简洁和专业的来回答用户的问题。
-                                如果无法从中得到答案，请说 "无答案"或"无答案" ，不允许在答案中添加编造成分，答案请使用中文。
-                                已知内容为吉利控股集团汽车销售有限公司的吉利用户手册:
-                                1: {emb_ans}
-                                问题:
-                                {question}""".format(emb_ans=emb_ans, question = query)
-    return prompt_template
-
-
-def question(text, llm, vector_store, prompt_template):
-
-    chain = get_qa_chain(llm, vector_store, prompt_template)
-
-    response = chain({"query": text})
-    return response
-
-def reRank(rerank, top_k, query, bm25_ans, faiss_ans):
-    """对Faiss和BM25召回的结果进行重排序
+    """构造重排序的prompt模板
     
     Args:
-        rerank: 重排序模型对象
-        top_k: 重排序后需要返回的文档数量
-        query: 用户查询文本
-        bm25_ans: BM25召回的文档列表
-        faiss_ans: Faiss召回的文档列表,每个元素是(doc, score)元组
+        emb_ans: 文档内容
+        query: 查询问题
     
     Returns:
-        str: 重排序后拼接的文档内容字符串
-        
-    主要步骤:
-        1. 将Faiss和BM25召回的文档合并到一个列表
-        2. 使用重排序模型对合并后的文档进行重新排序
-        3. 取排序后的前top_k个文档
-        4. 将文档内容拼接,控制总长度不超过max_length
+        str: 格式化后的prompt
     """
-    # 初始化文档列表和最大长度限制
-    items = []
-    max_length = 4000
-    
-    # 将Faiss召回结果中的文档添加到列表
-    for doc, score in faiss_ans:
-        items.append(doc)
-    
-    # 将BM25召回的文档添加到列表
-    items.extend(bm25_ans)
-    
-    # 使用重排序模型对文档重新排序
-    rerank_ans = rerank.predict(query, items)
-    
-    # 取排序后的前top_k个文档
-    rerank_ans = rerank_ans[:top_k]
-    
-    # 拼接重排序后的文档内容
-    emb_ans = ""
-    for doc in rerank_ans:
-        # 如果添加当前文档会超过最大长度限制,则停止添加
-        if(len(emb_ans + doc.page_content) > max_length):
-            break
-        emb_ans = emb_ans + doc.page_content
+    prompt_template = """基于以下已知信息，简洁和专业的来回答用户的问题。
+                            如果无法从中得到答案，请说 "无答案"或"无答案" ，不允许在答案中添加编造成分，答案请使用中文。
+                            已知内容为吉利控股集团汽车销售有限公司的吉利用户手册:
+                            1: {emb_ans}
+                            问题:
+                            {question}""".format(emb_ans=emb_ans, question=query)
+    return prompt_template
+
+def main():
+    """主函数"""
+    try:
+        # 设置GPU内存使用限制
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                torch.cuda.set_per_process_memory_fraction(GPU_MEMORY_FRACTION, i)
+                
+        start = time.time()
+        base = "."
+
+        # 解析pdf文档，构造数据
+        dp = DataProcess(pdf_path=base + "/data/train_a.pdf")
+        dp.ParseBlock(max_seq=1024)
+        dp.ParseBlock(max_seq=512)
+        print(len(dp.data))
+        dp.ParseAllPage(max_seq=256)
+        dp.ParseAllPage(max_seq=512)
+        print(len(dp.data))
+        dp.ParseOnePageWithRule(max_seq=256)
+        dp.ParseOnePageWithRule(max_seq=512)
+        print(len(dp.data))
         
-    return emb_ans
+        # 将字符串数据转换为Document对象
+        data = [Document(page_content=text) if isinstance(text, str) else text for text in dp.data]
+        print("data load ok")
+
+        # 初始化多路召回器和重排序器
+        multi_retriever = MultiRetriever(data, MODEL_PATHS)
+        multi_reranker = MultiReranker(MODEL_PATHS)
+        print("retriever and reranker load ok")
+
+        # LLM大模型
+        llm = ChatLLM(MODEL_PATHS["qwen"])
+        print("llm qwen load ok")
+
+        # 处理测试问题
+        with open(base + "/data/test_question.json", "r") as f:
+            jdata = json.loads(f.read())
+            print(len(jdata))
+            
+            for idx, line in enumerate(jdata):
+                query = line["question"]
+                print(f"\nProcessing question {idx}: {query}")
+
+                try:
+                    # 使用多路召回获取结果，增加召回数量
+                    merged_results = multi_retriever.get_merged_results(query, k=12)
+                    
+                    # 清理GPU缓存
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    # 使用多重排序器进行重排序，增加重排序数量
+                    reranked_docs = multi_reranker.rerank(query, [doc for doc, _ in merged_results], top_k=6)
+                    
+                    # 清理GPU缓存
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    # 处理召回的文档，使用优化后的参数
+                    merged_context = process_docs(merged_results, max_length=400, max_docs=4)
+                    reranked_context = process_docs(reranked_docs, max_length=400, max_docs=4)
+
+                    # 构造prompt并执行推理
+                    merged_prompt = get_rerank(merged_context, query)
+                    reranked_prompt = get_rerank(reranked_context, query)
+                    
+                    # 分批处理以减少内存使用
+                    batch_output = []
+                    for prompt in [merged_prompt, reranked_prompt]:
+                        try:
+                            result = llm.infer([prompt])
+                            if result:  # 确保结果不为空
+                                batch_output.extend(result)
+                            else:
+                                batch_output.append("生成答案失败")
+                        except Exception as e:
+                            print(f"Error in inference: {str(e)}")
+                            batch_output.append("生成答案失败")
+                        
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    
+                    # 保存结果，添加错误处理
+                    line["answer_1"] = batch_output[0] if len(batch_output) > 0 else "处理出错"
+                    line["answer_2"] = batch_output[1] if len(batch_output) > 1 else "处理出错"
+                    line["merged_context"] = merged_context
+                    line["reranked_context"] = reranked_context
+                    
+                except Exception as e:
+                    print(f"Error processing question {idx}: {str(e)}")
+                    line["answer_1"] = "处理出错"
+                    line["answer_2"] = "处理出错"
+                    line["merged_context"] = ""
+                    line["reranked_context"] = ""
+                    # 清理GPU缓存
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+
+            # 保存结果
+            json.dump(jdata, open(base + "/data/result.json", "w", encoding='utf-8'), ensure_ascii=False, indent=2)
+            end = time.time()
+            print("cost time: " + str(int(end-start)/60))
+            
+    except Exception as e:
+        print(f"Critical error in main: {str(e)}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise
 
 if __name__ == "__main__":
-
-    start = time.time()
-
-    base = "."
-    qwen7 = "/root/autodl-tmp/pre_train_model/Qwen-7B-Chat"
-    m3e = "/root/autodl-tmp/pre_train_model/m3e-large"
-    bge_reranker_large = "/root/autodl-tmp/pre_train_model/bge-reranker-large"
-
-    # 解析pdf文档，构造数据
-    dp =  DataProcess(pdf_path = base + "/data/train_a.pdf")
-    dp.ParseBlock(max_seq = 1024)
-    dp.ParseBlock(max_seq = 512)
-    print(len(dp.data))
-    dp.ParseAllPage(max_seq = 256)
-    dp.ParseAllPage(max_seq = 512)
-    print(len(dp.data))
-    dp.ParseOnePageWithRule(max_seq = 256)
-    dp.ParseOnePageWithRule(max_seq = 512)
-    print(len(dp.data))
-    data = dp.data
-    print("data load ok")
-
-    # Faiss召回
-    model_path = "/root/autodl-tmp/pre_train_model/m3e-large"
-    faissretriever = FaissRetriever(model_path, data)
-    vector_store = faissretriever.vector_store
-    print("faissretriever load ok")
-
-    # BM25召回
-    bm25 = BM25(data)
-    print("bm25 load ok")
-
-    # LLM大模型
-    llm = ChatLLM(qwen7)
-    print("llm qwen load ok")
-
-    # reRank模型
-    rerank = reRankLLM(bge_reranker_large)
-    print("rerank model load ok")
-
-    # 对每一条测试问题，做答案生成处理
-    with open(base + "/data/test_question.json", "r") as f:
-        jdata = json.loads(f.read())
-        print(len(jdata))
-        max_length = 4000
-        for idx, line in enumerate(jdata):
-            query = line["question"]
-
-            # faiss召回topk
-            # 使用faiss向量检索获取与query最相似的15个文档及其相似度分数
-            faiss_context = faissretriever.GetTopK(query, 15)
-            
-            # 初始化最小相似度分数为0
-            faiss_min_score = 0.0
-            
-            # 如果检索到了文档,获取第一个文档(最相似)的相似度分数
-            if(len(faiss_context) > 0):
-                faiss_min_score = faiss_context[0][1]
-                
-            # 处理检索到的文档,将其截断到max_length长度,作为后续生成的上下文
-            emb_ans = process_docs(faiss_context, max_length)
-
-            # bm2.5召回topk
-            bm25_context = bm25.GetBM25TopK(query, 15)
-            bm25_ans = process_docs(bm25_context, max_length)
-
-            # 构造合并bm25召回和向量召回的prompt
-            emb_bm25_merge_inputs = get_emb_bm25_merge(faiss_context, bm25_context, query)
-
-            # 构造bm25召回的prompt
-            bm25_inputs = get_rerank(bm25_ans, query)
-
-            # 构造向量召回的prompt
-            emb_inputs = get_rerank(emb_ans, query)
-
-            # rerank召回的候选，并按照相关性得分排序
-            rerank_ans = reRank(rerank, 6, query, bm25_context, faiss_context)
-            # 构造得到rerank后生成答案的prompt
-            rerank_inputs = get_rerank(rerank_ans, query)
-
-            batch_input = []
-            batch_input.append(emb_bm25_merge_inputs)
-            batch_input.append(bm25_inputs)
-            batch_input.append(emb_inputs)
-            batch_input.append(rerank_inputs)
-            # 执行batch推理
-            batch_output = llm.infer(batch_input)
-            line["answer_1"] = batch_output[0] # 合并两路召回的结果
-            line["answer_2"] = batch_output[1] # bm召回的结果
-            line["answer_3"] = batch_output[2] # 向量召回的结果
-            line["answer_4"] = batch_output[3] # 多路召回重排序后的结果
-            line["answer_5"] = emb_ans
-            line["answer_6"] = bm25_ans
-            line["answer_7"] = rerank_ans
-            # 如果faiss检索跟query的距离高于500，输出无答案
-            if(faiss_min_score >500):
-                line["answer_5"] = "无答案"
-            else:
-                line["answer_5"] = str(faiss_min_score)
-
-        # 保存结果，生成submission文件
-        json.dump(jdata, open(base + "/data/result.json", "w", encoding='utf-8'), ensure_ascii=False, indent=2)
-        end = time.time()
-        print("cost time: " + str(int(end-start)/60))
+    main()

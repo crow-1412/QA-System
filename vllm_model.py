@@ -68,13 +68,16 @@ class ChatLLM(object):
         Args:
             model_path (str): 预训练模型的路径
         """
+        # 设置显存优化环境变量
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        
         # 初始化tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
-            pad_token='<|extra_0|>',     # 设置填充token
-            eos_token='<|endoftext|>',   # 设置结束token  
-            padding_side='left',         # 设置在左侧进行填充
-            trust_remote_code=True       # 信任远程代码
+            pad_token='<|extra_0|>',     
+            eos_token='<|endoftext|>',   
+            padding_side='left',         
+            trust_remote_code=True       
         )
         
         # 加载生成配置
@@ -83,39 +86,61 @@ class ChatLLM(object):
             pad_token_id=self.tokenizer.pad_token_id
         )
         
-        # 将生成配置的结束token ID同步到tokenizer
         self.tokenizer.eos_token_id = self.generation_config.eos_token_id
-        
-        # 初始化停止词ID列表
         self.stop_words_ids = []
         
         # 加载vLLM大模型
-        self.model = LLM(
-            model=model_path,
-            tokenizer=model_path,
-            tensor_parallel_size=2,     # 保持双卡并行
-            trust_remote_code=True,
-            gpu_memory_utilization=0.8, # 降低内存使用率
-            dtype="bfloat16",
-            max_num_seqs=4,            # 限制并行序列数
-            max_num_batched_tokens=8192 # 修改为与max_model_len相同
-        )
+        print(f"\nInitializing vLLM model from {model_path}...")
+        try:
+            # 更激进的显存控制设置
+            model_max_len = 512  # 进一步减小最大序列长度
+            batch_tokens = 512   # 限制批处理大小
+            gpu_mem_util = 0.65   # 进一步降低显存使用率
+            
+            print(f"Initializing with settings: max_len={model_max_len}, gpu_util={gpu_mem_util}")
+            print("Available CUDA devices:", torch.cuda.device_count())
+            
+            # 清理现有GPU缓存
+            torch.cuda.empty_cache()
+            
+            self.model = LLM(
+                model=model_path,
+                tokenizer=model_path,
+                tensor_parallel_size=2,  # 保持双GPU并行
+                trust_remote_code=True,
+                gpu_memory_utilization=gpu_mem_util,
+                dtype="bfloat16",
+                max_num_seqs=1,  # 限制为单个序列
+                max_num_batched_tokens=batch_tokens,
+                max_model_len=model_max_len,
+                enforce_eager=True,
+                disable_custom_all_reduce=True  # 禁用自定义all reduce
+            )
+            print(f"vLLM model initialized successfully with max_model_len={model_max_len}")
+            print(f"Using {torch.cuda.device_count()} GPUs for tensor parallel inference")
+            
+            # 再次清理GPU缓存
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            print(f"Error initializing vLLM model: {str(e)}")
+            raise
         
         # 设置停止词
         for stop_id in get_stop_words_ids(self.generation_config.chat_format, self.tokenizer):
             self.stop_words_ids.extend(stop_id)
         self.stop_words_ids.extend([self.generation_config.eos_token_id])
 
-        # 修改采样参数
+        # 进一步限制生成参数
         sampling_kwargs = {
             "stop_token_ids": self.stop_words_ids,
-            "top_p": 1.0,
-            "top_k": 50,  # 修改为正数，避免 ValueError
-            "temperature": 0.7,  # 增加一些随机性
-            "max_tokens": 2000,
-            "repetition_penalty": self.generation_config.repetition_penalty,
+            "top_p": 0.8,
+            "top_k": 40,
+            "temperature": 0.6,
+            "max_tokens": 128,  # 进一步减小生成长度
+            "repetition_penalty": 1.1,
             "n": 1,
-            "best_of": 1  # 确保 best_of 等于 n
+            "best_of": 1
         }
         self.sampling_params = SamplingParams(**sampling_kwargs)
 
@@ -124,14 +149,28 @@ class ChatLLM(object):
         try:
             batch_text = []
             for q in prompts:
-                raw_text, _ = make_context(
-                    self.tokenizer,
-                    q,
-                    system="You are a helpful assistant.",
-                    max_window_size=self.generation_config.max_window_size,
-                    chat_format=self.generation_config.chat_format,
-                )
-                batch_text.append(raw_text)
+                try:
+                    raw_text, _ = make_context(
+                        self.tokenizer,
+                        q,
+                        system="You are a helpful assistant.",
+                        max_window_size=self.generation_config.max_window_size,
+                        chat_format=self.generation_config.chat_format,
+                    )
+                    # 检查文本长度
+                    tokens = self.tokenizer.encode(raw_text)
+                    if len(tokens) > 512:  # 如果超过最大长度，截断输入
+                        print(f"Warning: Input length {len(tokens)} exceeds limit 512, truncating...")
+                        tokens = tokens[:512]
+                        raw_text = self.tokenizer.decode(tokens)
+                    
+                    batch_text.append(raw_text)
+                except Exception as e:
+                    print(f"Error processing prompt: {str(e)}")
+                    batch_text.append("Error processing input")
+                
+            if not batch_text:  # 如果没有有效的输入
+                return ["生成答案失败"]
                 
             outputs = self.model.generate(
                 batch_text,
@@ -140,20 +179,25 @@ class ChatLLM(object):
             
             batch_response = []
             for output in outputs:
-                output_str = output.outputs[0].text
-                if IMEND in output_str:
-                    output_str = output_str[:-len(IMEND)]
-                if ENDOFTEXT in output_str:
-                    output_str = output_str[:-len(ENDOFTEXT)]
-                batch_response.append(output_str)
+                try:
+                    output_str = output.outputs[0].text
+                    if IMEND in output_str:
+                        output_str = output_str[:-len(IMEND)]
+                    if ENDOFTEXT in output_str:
+                        output_str = output_str[:-len(ENDOFTEXT)]
+                    batch_response.append(output_str)
+                except Exception as e:
+                    print(f"Error processing output: {str(e)}")
+                    batch_response.append("生成答案失败")
                 
             # 清理内存
             torch.cuda.empty_cache()
             return batch_response
+            
         except Exception as e:
             print(f"Error in infer: {str(e)}")
             torch.cuda.empty_cache()
-            return []
+            return ["生成答案失败"]
 
     def GetTopK(self, query, k):
         """获取top-K分数最高的文档块"""

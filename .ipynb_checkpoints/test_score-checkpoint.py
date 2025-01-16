@@ -4,22 +4,10 @@ import sys
 import re
 import numpy as np
 from text2vec import SentenceModel, semantic_search, Similarity
-import os
 
-# 修改模型路径并添加路径检查
-simModel_path = "/root/autodl-tmp/pre_train_model/text2vec-base-chinese"  # 相似度模型路径
 
-# 检查模型路径是否存在
-if not os.path.exists(simModel_path):
-    raise FileNotFoundError(f"模型路径不存在: {simModel_path}")
-
-try:
-    print(f"正在加载相似度模型: {simModel_path}")
-    simModel = SentenceModel(model_name_or_path=simModel_path, device='cuda:0')  # 使用第一张 GPU
-    print("相似度模型加载成功")
-except Exception as e:
-    print(f"加载相似度模型失败: {str(e)}")
-    raise
+simModel_path = './pre_train_model/text2vec-base-chinese'  # 相似度模型路径
+simModel = SentenceModel(model_name_or_path=simModel_path, device='cuda:0')  # 使用第一张 GPU
 
 def calc_jaccard(list_a, list_b, threshold=0.3):
     """计算关键词的Jaccard相似度
