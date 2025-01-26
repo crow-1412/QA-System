@@ -142,15 +142,27 @@ python tests/test_single_question.py
 
 ```
 QA-System/
-├── src/                # 源代码目录
-│   ├── knowledge/      # 知识处理相关代码
-│   │   └── knowledge_refiner.py  # 知识优化器
-│   ├── retriever/      # 检索器相关代码
-│   └── data_process.py # 数据处理模块
-├── tests/              # 测试文件
+├── src/                      # 源代码目录
+│   ├── knowledge/           # 知识处理相关代码
+│   │   ├── knowledge_refiner.py  # 知识优化器核心实现
+│   │   ├── knowledge_base.py     # 知识库基础类
+│   │   └── __init__.py
+│   ├── retriever/           # 检索器相关代码
+│   │   ├── multi_retriever.py    # 多策略检索器
+│   │   ├── reranker.py          # 重排序模块
+│   │   ├── embedding_model.py    # 嵌入模型基类
+│   │   ├── bge_retriever.py     # BGE检索器
+│   │   ├── bce_retriever.py     # BCE检索器
+│   │   ├── gte_retriever.py     # GTE检索器
+│   │   ├── bm25_retriever.py    # BM25检索器
+│   │   ├── faiss_retriever.py   # Faiss检索器
+│   │   ├── tfidf_retriever.py   # TF-IDF检索器
+│   │   └── stopwords.py         # 停用词处理
+│   └── data_process.py      # 数据处理模块
+├── tests/                   # 测试文件
 │   └── test_single_question.py  # 单问题测试
-├── data/               # 数据文件
-└── requirements.txt    # 项目依赖
+├── data/                    # 数据文件
+└── requirements.txt         # 项目依赖
 ```
 
 ## 注意事项
