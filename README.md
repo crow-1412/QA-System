@@ -211,36 +211,8 @@ python -c "from sentence_transformers import SentenceTransformer; SentenceTransf
 python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('maidalun1020/bce-embedding-base_v1')"
 ```
 
-## 使用方法
-
-系统提供两种使用方式：
-
-### 1. 组件化方式（推荐）
-
-使用 `run.py` 启动系统，这种方式提供了更灵活的组件配置和更好的性能：
-
-```bash
-python run.py --model_path /path/to/model --device cuda
-```
-
 主要特点：
 - 支持多种文档解析方法
 - 灵活的组件配置
 - 更好的性能优化
 - 实时处理反馈
-
-### 2. 集成式方式
-
-使用 `qa_pipeline.py` 的集成实现，主要用于测试和性能比较：
-
-```python
-from src.qa_pipeline import QAPipeline
-from src.qa_config import QAConfig
-
-# 初始化系统
-config = QAConfig.get_config()
-qa_system = QAPipeline(config)
-
-# 处理问题
-result = qa_system.answer_question("您的问题")
-```
